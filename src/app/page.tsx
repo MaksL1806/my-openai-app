@@ -2,6 +2,8 @@
 
 import { useState } from "react";
 
+type ApiResponse = { text?: string; error?: string };
+
 export default function Home() {
   const [prompt, setPrompt] = useState("");
   const [answer, setAnswer] = useState("");
@@ -20,11 +22,16 @@ export default function Home() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ prompt }),
       });
-      const data = await res.json();
+
+      // уникнути any від res.json()
+      const raw: unknown = await res.json();
+      const data = raw as ApiResponse;
+
       if (!res.ok) throw new Error(data?.error || "Request failed");
       setAnswer(data.text || "");
-    } catch (err: any) {
-      setError(err.message || "Unknown error");
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : "Unknown error";
+      setError(message);
     } finally {
       setLoading(false);
     }
@@ -33,6 +40,7 @@ export default function Home() {
   return (
     <main style={{ maxWidth: 720, margin: "40px auto", fontFamily: "system-ui" }}>
       <h1>Ask OpenAI (gpt-4o-mini)</h1>
+
       <form onSubmit={handleSubmit} style={{ display: "grid", gap: 12 }}>
         <textarea
           value={prompt}
@@ -46,6 +54,7 @@ export default function Home() {
       </form>
 
       {error && <p style={{ color: "crimson" }}>Помилка: {error}</p>}
+
       {answer && (
         <>
           <h2>Відповідь</h2>
