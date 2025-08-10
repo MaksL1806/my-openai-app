@@ -1,8 +1,16 @@
-import OpenAI from "openai";
+// src/app/api/cards/route.js
 import { NextResponse } from "next/server";
+import OpenAI from "openai";
 
-export const dynamic = "force-dynamic"; // не кешувати на верселі
+export const dynamic = "force-dynamic";
+
+// Дозволений фронтовий домен (для CORS)
 const ORIGIN = process.env.ALLOW_ORIGIN || "*";
+
+// Ініціалізація OpenAI SDK (ключ у Vercel: OPENAI_API_KEY)
+const client = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
+});
 
 /** Допоміжний JSON-відповідач з CORS */
 function corsJson(data, status = 200) {
@@ -17,101 +25,91 @@ function corsJson(data, status = 200) {
     },
   });
 }
+
+/** CORS preflight */
 export function OPTIONS() {
-  return corsJson({ ok: true }, 204);
+  return corsJson({ ok: true }, 200);
 }
 
-/** Основний генератор карток */
-async function generateCards({ topic, level, count, native }) {
-  const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+/** POST /api/cards */
+export async function POST(req) {
+  if (!process.env.OPENAI_API_KEY) {
+    return corsJson({ error: "Missing OPENAI_API_KEY" }, 500);
+  }
+
+  const raw = await req.text();
+  let body;
+  try {
+    body = raw ? JSON.parse(raw) : {};
+  } catch {
+    return corsJson({ error: "Bad JSON from client", raw }, 400);
+  }
+
+  const { topic = "daily life", level = "A2", count = 8, style = "kid" } = body;
+
+  const schema = `{
+    "cards": [
+      {
+        "word": "string (one English word)",
+        "translation": "string (Ukrainian)",
+        "example_en": "string",
+        "example_uk": "string",
+        "pos": "string",
+        "ipa": "string"
+      }
+    ]
+  }`;
 
   const prompt = `
-You are an English teacher. Create ${count} simple flashcards on the topic "${topic}" for level ${level}.
-Return **strict JSON** ONLY, with this shape:
+You are an ESL teacher. Create ${count} flashcards for an ${level} learner on the topic "${topic}" in a playful style "${style}".
 
-{
-  "cards": [
-    {
-      "word": "string (English word/phrase)",
-      "translation": "string (translation to ${native})",
-      "example_en": "string (simple English sentence with the word)",
-      "example_native": "string (translation of the sentence to ${native})"
-    }
-  ]
-}
+Each flashcard must have:
+- word: one English word (lowercase, no quotes)
+- translation: Ukrainian translation of the word
+- example_en: a short simple English sentence using the word
+- example_uk: Ukrainian translation of the example
+- pos: part of speech (noun/verb/adj/etc.)
+- ipa: IPA transcription of the word (e.g., /ˈhɛləʊ/)
 
-Constraints:
-- No markdown, no comments, no extra text.
-- The JSON must parse with JSON.parse() without errors.
-- Keep sentences short, friendly and useful for learners.
-`;
+Return ONLY valid JSON that EXACTLY matches this schema (no markdown, no code fences):
+${schema}
 
-  const res = await client.responses.create({
-    model: "gpt-4o-mini",
-    input: prompt,
-    response_format: { type: "json_object" },
-  });
+Keep outputs short and age-appropriate if "style" implies kids.
+If you cannot follow the schema, still return valid JSON with "cards": [].
+  `.trim();
 
-  const raw = res.output_text ?? "";
-  let parsed;
   try {
-    parsed = JSON.parse(raw);
-  } catch (e) {
-    // Спроба вичистити зайве, якщо модель щось додала
-    const match = raw.match(/\{[\s\S]*\}/);
-    if (match) {
-      parsed = JSON.parse(match[0]);
-    } else {
-      throw new Error("Bad JSON from model");
+    const completion = await client.responses.create({
+      model: "gpt-4o-mini",
+      input: prompt,
+      text: { format: "json" }, // 👈 новий параметр, text: { format: "json" }
+    });
+
+    const text = (completion.output_text || "").trim();
+    if (!text) {
+      return corsJson(
+        { error: "Empty response from model", raw: completion },
+        502
+      );
     }
-  }
 
-  if (!parsed?.cards?.length) throw new Error("No cards in model output");
-  return parsed.cards;
-}
-
-/** Спільний хендлер (GET/POST) */
-async function handle(req) {
-  try {
-    // пріоритет: body → query
-    let params = {};
+    let parsed;
     try {
-      params = await req.json();
-    } catch (_) {
-      // якщо не JSON — читаємо query
-      const q = req.nextUrl.searchParams;
-      params = {
-        topic: q.get("topic"),
-        level: q.get("level"),
-        count: q.get("count"),
-        native: q.get("native"),
-      };
+      parsed = JSON.parse(text);
+    } catch {
+      return corsJson(
+        { error: "Model did not return valid JSON", raw: text },
+        502
+      );
     }
 
-    const topic = (params.topic || "daily life").toString();
-    const level = (params.level || "A2").toString();
-    const count = Math.max(1, Math.min(30, parseInt(params.count || 8, 10)));
-    const native = (params.native || "uk").toString();
-
-    if (!process.env.OPENAI_API_KEY) {
-      return corsJson({ error: "Missing OPENAI_API_KEY" }, 500);
+    if (!parsed?.cards || !Array.isArray(parsed.cards) || parsed.cards.length === 0) {
+      return corsJson({ error: "No cards in response", raw: parsed }, 502);
     }
 
-    const cards = await generateCards({ topic, level, count, native });
-    return corsJson({ ok: true, cards });
+    return corsJson(parsed, 200);
   } catch (e) {
-    console.error("API /cards error:", e);
-    return corsJson(
-      { error: "Server error", detail: String(e?.message || e) },
-      500
-    );
+    console.error("OpenAI error:", e);
+    return corsJson({ error: "Server error", detail: String(e) }, 500);
   }
-}
-
-export async function GET(req) {
-  return handle(req);
-}
-
-export async function POST(req) {
-  return handle(req);
 }
