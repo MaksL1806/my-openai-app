@@ -1,76 +1,116 @@
-import OpenAI from "openai";
-import { NextResponse } from "next/server";
+// src/app/api/cards/route.ts
+// Next.js App Router (Node runtime) — генерація карток слів через OpenAI
 
-export const dynamic = "force-dynamic";
-export const runtime = "nodejs";
+export const runtime = 'nodejs';
 
-const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY! });
-const ORIGIN = process.env.ALLOW_ORIGIN || "*";
-const VERSION = "cards-2025-08-10-fix-format";
+const CORS_HEADERS = {
+  'Access-Control-Allow-Origin': '*',                 // за потреби вкажіть ваш домен Tilda замість *
+  'Access-Control-Allow-Methods': 'POST, OPTIONS',
+  'Access-Control-Allow-Headers': 'content-type, authorization',
+  'Access-Control-Max-Age': '86400'
+};
 
-function corsJson(data: unknown, status = 200) {
-  return new NextResponse(JSON.stringify(data), {
-    status,
-    headers: {
-      "content-type": "application/json",
-      "access-control-allow-origin": ORIGIN,
-      "access-control-allow-methods": "POST,OPTIONS",
-      "access-control-allow-headers": "content-type,authorization",
-      "cache-control": "no-store",
-      "x-app-version": VERSION,
-    },
-  });
+type RequestBody = {
+  topic?: string;
+  count?: number;
+  targetLang?: string;
+  avoid?: string[]; // терміни, яких треба уникати
+};
+
+function sanitizeStr(s: unknown, max = 120): string {
+  return String(s ?? '').trim().slice(0, max);
+}
+function sanitizeItem(x: any) {
+  return {
+    term: sanitizeStr(x?.term, 60),
+    translation: sanitizeStr(x?.translation, 120),
+    example: sanitizeStr(x?.example, 140)
+  };
 }
 
-export function OPTIONS() {
-  return corsJson({});
+export async function OPTIONS() {
+  // Preflight для CORS
+  return new Response(null, { status: 204, headers: CORS_HEADERS });
 }
 
 export async function POST(req: Request) {
   try {
-    // читаємо raw body, щоб у 400 показати, що прилетіло
-    const raw = await req.text();
-
-    let prompt: string | undefined;
+    let body: RequestBody = {};
     try {
-      const parsed = raw ? JSON.parse(raw) : {};
-      if (parsed && typeof parsed.prompt === "string") {
-        prompt = parsed.prompt;
+      body = (await req.json?.()) as RequestBody;
+    } catch {
+      body = {};
+    }
+
+    const topic = sanitizeStr(body.topic || 'general', 80);
+    const count = Math.max(1, Math.min(50, Number(body.count) || 8)); // невелика межа безпеки
+    const targetLang = sanitizeStr(body.targetLang || 'uk', 10);
+
+    // Обробка avoid: знижуємо регістр, прибираємо дублі, обрізаємо довжину
+    const avoidInput = Array.isArray(body.avoid) ? body.avoid : [];
+    const avoidSet = new Set(
+      avoidInput
+        .map(t => String(t || '').toLowerCase().trim())
+        .filter(Boolean)
+        .slice(0, 200) // межа, щоб не роздувати prompt
+    );
+    const avoidList = Array.from(avoidSet).join(', ').slice(0, 2000); // будьте обережні з довжиною промпта
+
+    const messages = [
+      { role: 'system', content: 'You are a concise vocabulary generator. Output strict JSON.' },
+      {
+        role: 'user',
+        content:
+          `Give ${count} beginner-friendly English vocabulary items about "${topic}". ` +
+          `Return JSON with key "items": [{ "term": "...", "translation": "...", "example": "..." }]. ` +
+          `Translate "translation" to language code ${targetLang}. ` +
+          (avoidSet.size ? `Avoid these terms entirely: [${avoidList}]. ` : '') +
+          `Do not repeat; diversify parts of speech; keep examples natural and <= 8 words.`
       }
-    } catch (e) {
-      console.error("Bad JSON body:", raw, e);
-      return corsJson({ error: "Bad JSON", raw }, 400);
-    }
+    ];
 
-    if (!prompt) {
-      return corsJson({ error: "No prompt provided", raw }, 400);
-    }
-
-    // ВАЖЛИВО: формат як ОБ’ЄКТ: { format: { type: "json" } }
-    const completion = await client.responses.create({
-      model: "gpt-4o-mini",
-      input: prompt,
-      text: { format: { type: "json" } },
+    const r = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${process.env.OPENAI_API_KEY || ''}`
+      },
+      body: JSON.stringify({
+        model: 'gpt-4o-mini',
+        temperature: 0.7,
+        messages,
+        response_format: { type: 'json_object' }
+      })
     });
 
-    const out = ((completion as any).output_text ?? "").trim();
-    if (!out) {
-      return corsJson({ error: "Empty response from model", raw: completion }, 502);
+    if (!r.ok) {
+      const details = await r.text().catch(() => '');
+      return new Response(JSON.stringify({ error: 'OpenAI error', details }), {
+        status: 500,
+        headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' }
+      });
     }
 
-    let parsed: unknown;
+    const out = await r.json();
+    let parsed: any = {};
     try {
-      parsed = JSON.parse(out);
-    } catch (e) {
-      console.error("Model returned non-JSON:", out, e);
-      return corsJson({ error: "Model returned non-JSON", text: out }, 502);
+      parsed = JSON.parse(out?.choices?.[0]?.message?.content ?? '{}');
+    } catch {
+      parsed = {};
     }
 
-    return corsJson(parsed, 200);
+    const items = Array.isArray(parsed?.items)
+      ? parsed.items.map(sanitizeItem).filter(x => x.term && x.translation)
+      : [];
+
+    return new Response(JSON.stringify({ items }), {
+      status: 200,
+      headers: { ...CORS_HEADERS, 'Content-Type': 'application/json', 'Cache-Control': 'no-store' }
+    });
   } catch (e: any) {
-    const detail = e?.response?.data ?? e?.message ?? String(e);
-    console.error("API /api/cards fatal error:", e);
-    return corsJson({ error: "Server error", detail }, 500);
+    return new Response(JSON.stringify({ error: e?.message || 'Server error' }), {
+      status: 500,
+      headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' }
+    });
   }
 }
-
