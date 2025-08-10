@@ -1,11 +1,12 @@
 // src/app/api/cards/route.ts
+// Next.js App Router (Node runtime) — генерація карток слів через OpenAI
 import { NextRequest, NextResponse } from 'next/server';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
 const CORS_HEADERS: Record<string, string> = {
-  'Access-Control-Allow-Origin': '*', // за потреби постав свій домен Tilda
+  'Access-Control-Allow-Origin': '*', // за потреби вкажіть домен Tilda
   'Access-Control-Allow-Methods': 'POST, OPTIONS',
   'Access-Control-Allow-Headers': 'content-type, authorization',
   'Access-Control-Max-Age': '86400'
@@ -18,14 +19,30 @@ type RequestBody = {
   avoid?: string[];
 };
 
-function sanitizeStr(s: unknown, max = 120): string {
-  return String(s ?? '').trim().slice(0, max);
+type OpenAIChoice = { message?: { content?: string } };
+type OpenAIChatResponse = { choices?: OpenAIChoice[] };
+
+type Item = {
+  term: string;
+  translation: string;
+  example?: string;
+};
+
+function sanitizeStr(input: unknown, max = 120): string {
+  return String(input ?? '').trim().slice(0, max);
 }
-function sanitizeItem(x: any) {
+
+function isItemLike(x: unknown): x is Partial<Item> {
+  if (!x || typeof x !== 'object') return false;
+  const obj = x as Record<string, unknown>;
+  return 'term' in obj || 'translation' in obj || 'example' in obj;
+}
+
+function sanitizeItem(x: Partial<Item>): Item {
   return {
-    term: sanitizeStr(x?.term, 60),
-    translation: sanitizeStr(x?.translation, 120),
-    example: sanitizeStr(x?.example, 140)
+    term: sanitizeStr(x.term, 60),
+    translation: sanitizeStr(x.translation, 120),
+    example: sanitizeStr(x.example, 140)
   };
 }
 
@@ -35,14 +52,20 @@ export async function OPTIONS() {
 
 export async function POST(req: NextRequest) {
   try {
+    // ---- parse request body (no 'any')
     let body: RequestBody = {};
-    try { body = (await req.json()) as RequestBody; } catch { body = {}; }
+    try {
+      body = (await req.json()) as RequestBody;
+    } catch {
+      body = {};
+    }
 
     const topic = sanitizeStr(body.topic || 'general', 80);
     const count = Math.max(1, Math.min(50, Number(body.count) || 8));
     const targetLang = sanitizeStr(body.targetLang || 'uk', 10);
 
-    const avoidInput = Array.isArray(body.avoid) ? body.avoid : [];
+    // avoid terms
+    const avoidInput: string[] = Array.isArray(body.avoid) ? body.avoid : [];
     const avoidSet = new Set(
       avoidInput.map(t => String(t || '').toLowerCase().trim()).filter(Boolean).slice(0, 200)
     );
@@ -83,22 +106,35 @@ export async function POST(req: NextRequest) {
       });
     }
 
-    const out = await r.json();
-    let parsed: any = {};
-    try { parsed = JSON.parse(out?.choices?.[0]?.message?.content ?? '{}'); } catch { parsed = {}; }
+    // ---- parse OpenAI response
+    const out = (await r.json()) as OpenAIChatResponse;
+    const content = out?.choices?.[0]?.message?.content ?? '{}';
 
-    const items = Array.isArray(parsed?.items)
-      ? parsed.items.map(sanitizeItem).filter(x => x.term && x.translation)
+    let parsed: unknown = {};
+    try {
+      parsed = JSON.parse(content);
+    } catch {
+      parsed = {};
+    }
+
+    const itemsRaw = (parsed as { items?: unknown }).items;
+    const items: Item[] = Array.isArray(itemsRaw)
+      ? itemsRaw
+          .filter(isItemLike)
+          .map((x) => sanitizeItem(x as Partial<Item>))
+          .filter((x) => x.term && x.translation)
       : [];
 
     return new NextResponse(JSON.stringify({ items }), {
       status: 200,
       headers: { ...CORS_HEADERS, 'Content-Type': 'application/json', 'Cache-Control': 'no-store' }
     });
-  } catch (e: any) {
-    return new NextResponse(JSON.stringify({ error: e?.message || 'Server error' }), {
+  } catch (e) {
+    const message = e instanceof Error ? e.message : 'Server error';
+    return new NextResponse(JSON.stringify({ error: message }), {
       status: 500,
       headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' }
     });
   }
 }
+
