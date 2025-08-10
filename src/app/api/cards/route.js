@@ -1,105 +1,59 @@
-// src/app/api/cards/route.js
-import { NextResponse } from "next/server";
 import OpenAI from "openai";
 
-export const dynamic = "force-dynamic";
+export const dynamic = "force-dynamic"; // щоб Vercel не кешував
+
 const ORIGIN = process.env.ALLOW_ORIGIN || "*";
-const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 function corsJson(data, status = 200) {
-  return new NextResponse(JSON.stringify(data), {
+  return new Response(JSON.stringify(data), {
     status,
     headers: {
-      "content-type": "application/json; charset=utf-8",
+      "content-type": "application/json",
       "access-control-allow-origin": ORIGIN,
       "access-control-allow-methods": "GET,POST,OPTIONS",
-      "access-control-allow-headers": "Content-Type, Authorization",
+      "access-control-allow-headers": "content-type, authorization",
       "cache-control": "no-store",
     },
   });
 }
 
 export function OPTIONS() {
-  return corsJson({ ok: true }, 204);
+  return corsJson({ ok: true });
 }
 
 export async function POST(req) {
   try {
-    const body = await req.json().catch(() => ({}));
-    const { level = "A1", topic = "daily life", count = 10 } = body || {};
-    const safeCount = Math.min(Math.max(parseInt(count, 10) || 10, 1), 50);
-
-    const prompt = `
-You are an English teacher creating vocabulary flashcards.
-Level: ${level}
-Topic: ${topic}
-Count: ${safeCount}
-
-Return a strict JSON object with **only** this shape:
-{
-  "cards": [
-    {
-      "word": "string",
-      "translation": "string",
-      "example_en": "string",
-      "example_uk": "string",
-      "pos": "string",
-      "ipa": "string"
+    const { prompt } = await req.json();
+    if (!prompt || typeof prompt !== "string") {
+      return corsJson({ error: "No prompt" }, 400);
     }
-  ]
-}
-Do not include any commentary. JSON only.
-`;
 
-    // 👇 ЖОДНОГО response_format тут бути не повинно
-    const payload = {
+    const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+    const completion = await client.responses.create({
       model: "gpt-4o-mini",
       input: prompt,
-      text: { format: "json" },     // новий параметр Responses API
-    };
-    console.log("DEBUG payload", JSON.stringify(payload));
+      // У Responses API це правильний параметр:
+      text: { format: "json" },
+    });
 
-    const completion = await client.responses.create(payload);
-
-    const text =
-      completion.output_text ??
-      completion.output?.[0]?.content
-        ?.map((c) => c?.text?.value)
-        .filter(Boolean)
-        .join("") ??
-      "";
-
-    if (!text.trim()) {
-      return corsJson({ error: "Empty response from model", raw: completion }, 500);
+    // ГОЛОВНЕ: беремо текст саме так
+    const text = (completion.output_text ?? "").trim();
+    if (!text) {
+      return corsJson({ error: "Empty response from model", raw: completion }, 502);
     }
 
+    // Спробуємо розпарсити JSON, який повернули
     let parsed;
     try {
       parsed = JSON.parse(text);
-    } catch {
-      return corsJson({ error: "Bad JSON from model", raw: text }, 500);
+    } catch (e) {
+      return corsJson({ error: "Bad JSON from model", rawText: text }, 500);
     }
 
-    if (!parsed?.cards || !Array.isArray(parsed.cards)) {
-      return corsJson({ error: "No cards in JSON", raw: parsed }, 500);
-    }
-
-    const cards = parsed.cards.map((c) => ({
-      word: String(c.word || "").trim(),
-      translation: String(c.translation || "").trim(),
-      example_en: String(c.example_en || "").trim(),
-      example_uk: String(c.example_uk || "").trim(),
-      pos: String(c.pos || "").trim(),
-      ipa: String(c.ipa || "").trim(),
-    }));
-
-    return corsJson({ cards });
+    return corsJson(parsed, 200);
   } catch (e) {
-    console.error(e);
+    console.error("API /api/cards error:", e);
     return corsJson({ error: "Server error", detail: String(e) }, 500);
   }
-}
-
-export async function GET() {
-  return corsJson({ ok: true, hint: "POST here with { level, topic, count }" });
 }
