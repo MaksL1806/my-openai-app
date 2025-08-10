@@ -1,10 +1,11 @@
 // src/app/api/cards/route.ts
-// Next.js App Router (Node runtime) — генерація карток слів через OpenAI
+import { NextRequest, NextResponse } from 'next/server';
 
 export const runtime = 'nodejs';
+export const dynamic = 'force-dynamic';
 
-const CORS_HEADERS = {
-  'Access-Control-Allow-Origin': '*',                 // за потреби вкажіть ваш домен Tilda замість *
+const CORS_HEADERS: Record<string, string> = {
+  'Access-Control-Allow-Origin': '*', // за потреби постав свій домен Tilda
   'Access-Control-Allow-Methods': 'POST, OPTIONS',
   'Access-Control-Allow-Headers': 'content-type, authorization',
   'Access-Control-Max-Age': '86400'
@@ -14,7 +15,7 @@ type RequestBody = {
   topic?: string;
   count?: number;
   targetLang?: string;
-  avoid?: string[]; // терміни, яких треба уникати
+  avoid?: string[];
 };
 
 function sanitizeStr(s: unknown, max = 120): string {
@@ -29,32 +30,23 @@ function sanitizeItem(x: any) {
 }
 
 export async function OPTIONS() {
-  // Preflight для CORS
-  return new Response(null, { status: 204, headers: CORS_HEADERS });
+  return new NextResponse(null, { status: 204, headers: CORS_HEADERS });
 }
 
-export async function POST(req: Request) {
+export async function POST(req: NextRequest) {
   try {
     let body: RequestBody = {};
-    try {
-      body = (await req.json?.()) as RequestBody;
-    } catch {
-      body = {};
-    }
+    try { body = (await req.json()) as RequestBody; } catch { body = {}; }
 
     const topic = sanitizeStr(body.topic || 'general', 80);
-    const count = Math.max(1, Math.min(50, Number(body.count) || 8)); // невелика межа безпеки
+    const count = Math.max(1, Math.min(50, Number(body.count) || 8));
     const targetLang = sanitizeStr(body.targetLang || 'uk', 10);
 
-    // Обробка avoid: знижуємо регістр, прибираємо дублі, обрізаємо довжину
     const avoidInput = Array.isArray(body.avoid) ? body.avoid : [];
     const avoidSet = new Set(
-      avoidInput
-        .map(t => String(t || '').toLowerCase().trim())
-        .filter(Boolean)
-        .slice(0, 200) // межа, щоб не роздувати prompt
+      avoidInput.map(t => String(t || '').toLowerCase().trim()).filter(Boolean).slice(0, 200)
     );
-    const avoidList = Array.from(avoidSet).join(', ').slice(0, 2000); // будьте обережні з довжиною промпта
+    const avoidList = Array.from(avoidSet).join(', ').slice(0, 2000);
 
     const messages = [
       { role: 'system', content: 'You are a concise vocabulary generator. Output strict JSON.' },
@@ -85,7 +77,7 @@ export async function POST(req: Request) {
 
     if (!r.ok) {
       const details = await r.text().catch(() => '');
-      return new Response(JSON.stringify({ error: 'OpenAI error', details }), {
+      return new NextResponse(JSON.stringify({ error: 'OpenAI error', details }), {
         status: 500,
         headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' }
       });
@@ -93,22 +85,18 @@ export async function POST(req: Request) {
 
     const out = await r.json();
     let parsed: any = {};
-    try {
-      parsed = JSON.parse(out?.choices?.[0]?.message?.content ?? '{}');
-    } catch {
-      parsed = {};
-    }
+    try { parsed = JSON.parse(out?.choices?.[0]?.message?.content ?? '{}'); } catch { parsed = {}; }
 
     const items = Array.isArray(parsed?.items)
       ? parsed.items.map(sanitizeItem).filter(x => x.term && x.translation)
       : [];
 
-    return new Response(JSON.stringify({ items }), {
+    return new NextResponse(JSON.stringify({ items }), {
       status: 200,
       headers: { ...CORS_HEADERS, 'Content-Type': 'application/json', 'Cache-Control': 'no-store' }
     });
   } catch (e: any) {
-    return new Response(JSON.stringify({ error: e?.message || 'Server error' }), {
+    return new NextResponse(JSON.stringify({ error: e?.message || 'Server error' }), {
       status: 500,
       headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' }
     });
