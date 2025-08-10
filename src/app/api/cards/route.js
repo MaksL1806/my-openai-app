@@ -1,5 +1,4 @@
-import OpenAI from "openai";
-
+// src/app/api/cards/route.js
 export const dynamic = "force-dynamic"; // щоб Vercel не кешував
 
 const ORIGIN = process.env.ALLOW_ORIGIN || "*";
@@ -28,32 +27,48 @@ export async function POST(req) {
       return corsJson({ error: "No prompt" }, 400);
     }
 
-    const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-
-    const completion = await client.responses.create({
-      model: "gpt-4o-mini",
-      input: prompt,
-      // У Responses API це правильний параметр:
-      text: { format: "json" },
+    const r = await fetch("https://api.openai.com/v1/responses", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model: "gpt-4o-mini",
+        input: prompt,
+        // У Responses API параметр перенесено сюди:
+        text: { format: "json" },
+      }),
     });
 
-    // ГОЛОВНЕ: беремо текст саме так
-    const text = (completion.output_text ?? "").trim();
-    if (!text) {
-      return corsJson({ error: "Empty response from model", raw: completion }, 502);
+    const data = await r.json();
+
+    // Якщо OpenAI повернув помилку — віддамо її як є, щоб бачити причину
+    if (!r.ok) {
+      return corsJson(
+        { error: data?.error?.message || "OpenAI error", data },
+        r.status
+      );
     }
 
-    // Спробуємо розпарсити JSON, який повернули
+    // Responses API повертає текст тут
+    const text = (data?.output_text ?? "").trim();
+    if (!text) {
+      return corsJson({ error: "Empty output_text", data }, 502);
+    }
+
+    // Очікуємо JSON від моделі
     let parsed;
     try {
       parsed = JSON.parse(text);
-    } catch (e) {
+    } catch {
+      // показуємо сирий текст, щоб було видно що саме відповіла модель
       return corsJson({ error: "Bad JSON from model", rawText: text }, 500);
     }
 
     return corsJson(parsed, 200);
   } catch (e) {
-    console.error("API /api/cards error:", e);
+    // максимум інформації у відповідь, щоб знайти причину
     return corsJson({ error: "Server error", detail: String(e) }, 500);
   }
 }
