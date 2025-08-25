@@ -1,108 +1,78 @@
-// src/app/api/cards/route.ts
-import OpenAI, { APIError } from "openai";
-import { NextResponse } from "next/server";
+import axios from 'axios';
+import * as cheerio from 'cheerio';
+import { db } from '@/firebase-admin';
+import { NextRequest } from 'next/server';
 
-const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY! });
-const ORIGIN = process.env.ALLOW_ORIGIN || "*";
-
-function corsJson(data: unknown, status = 200) {
-  return new NextResponse(JSON.stringify(data), {
-    status,
-    headers: {
-      "content-type": "application/json",
-      "access-control-allow-origin": ORIGIN,
-      "access-control-allow-methods": "POST,OPTIONS",
-      "access-control-allow-headers": "content-type,authorization",
-      "cache-control": "no-store",
-    },
-  });
+function formatSection(title: string, content: string) {
+  return `<br><b>${title}</b><br>&nbsp;<br>${content}<br>&nbsp;`;
 }
 
-export function OPTIONS() {
-  return corsJson({});
-}
-
-export async function POST(req: Request) {
+export async function POST(req: NextRequest) {
   try {
-    if (!process.env.OPENAI_API_KEY) {
-      return corsJson(
-        { error: "Missing OPENAI_API_KEY on server" },
-        500
-      );
+    const body = await req.json();
+    const code = body.code;
+
+    if (!code) {
+      return new Response("Missing code", { status: 400 });
     }
 
-    // 1) Безпечний парсінг тіла
-    const raw = await req.text();
-    let prompt: string | undefined;
+    const url = `https://rozetka.com.ua/ua/p${code}`;
+    const { data: html } = await axios.get(url);
+    const $ = cheerio.load(html);
 
-    try {
-      const parsed = JSON.parse(raw || "{}");
-      prompt = typeof parsed?.prompt === "string" ? parsed.prompt : undefined;
-    } catch (e) {
-      console.error("JSON parse error:", e);
-      return corsJson({ error: "Bad JSON", raw }, 400);
+    const text = $('[class*="product-about__description"]').text();
+
+    const sections = {
+      description: '',
+      advantages: '',
+      composition: '',
+      analysis: '',
+      feeding: '',
+      recommendations: '',
+      contraindications: ''
+    };
+
+    for (const [key] of Object.entries(sections)) {
+      const regex = new RegExp(`${key === 'feeding' ? 'норми годування' : key}`, 'i');
+      const match = text.match(regex);
+      if (match) {
+        const start = match.index!;
+        const nextMatch = Object.keys(sections)
+          .filter(k => k !== key)
+          .map(k => text.search(new RegExp(k, 'i')))
+          .filter(index => index > start)
+          .sort((a, b) => a - b)[0] || text.length;
+
+        sections[key as keyof typeof sections] = text.slice(start, nextMatch).trim();
+      }
     }
 
-    if (!prompt) {
-      return corsJson({ error: "No prompt in body", raw }, 400);
-    }
+    const finalText = [
+      formatSection("Опис", sections.description),
+      formatSection("Переваги", sections.advantages),
+      formatSection("Склад", sections.composition.replace(/\n+/g, ' ').replace(/\s+/g, ' ').trim()),
+      formatSection("Аналіз", sections.analysis),
+      formatSection("Норми годування", sections.feeding),
+      formatSection("Рекомендації до застосування", sections.recommendations),
+      formatSection("Протипоказання", sections.contraindications)
+    ].join('\n');
 
-    // 2) Виклик Responses API — БЕЗ text/response_format
-    const systemHint =
-      "Return ONLY valid JSON. No prose, no markdown, no code fences. The JSON must parse.";
-
-    const completion = await client.responses.create({
-      model: "gpt-4o-mini",
-      input: `${systemHint}\n\nTask: ${prompt}`,
+    await db.collection('cards').doc(code).set({
+      code,
+      content: finalText,
+      createdAt: new Date().toISOString(),
     });
 
-    // 3) Тягнемо суцільний текст з відповіді
-    const text = (completion.output_text ?? "").trim();
-    if (!text) {
-      console.error("Empty output_text from model:", completion);
-      return corsJson({ error: "Empty response from model", raw: completion }, 502);
-    }
+    return new Response(JSON.stringify({ result: finalText }), {
+      headers: { 'Content-Type': 'application/json' },
+      status: 200,
+    });
 
-    // 4) Намагаємося розпарсити JSON
-    try {
-      const parsed = JSON.parse(text);
-      return corsJson(parsed, 200);
-    } catch {
-      console.error("Model did not return valid JSON. Raw text:", text);
-      return corsJson({ error: "Model did not return valid JSON", text }, 502);
-    }
-  } catch (err: unknown) {
-    // 5) Дуже докладна діагностика
-    if (err instanceof APIError) {
-      console.error("OpenAI APIError:", {
-        status: err.status,
-        type: err.type,
-        code: err.code,
-        param: err.param,
-        message: err.message,
-        // @ts-ignore
-        raw: err.error,
-      });
-      return corsJson(
-        {
-          error: "OpenAI API error",
-          status: err.status,
-          type: err.type,
-          code: err.code,
-          param: err.param,
-          message: err.message,
-          // @ts-ignore
-          raw: err.error,
-        },
-        err.status ?? 500
-      );
-    }
-
-    const e = err as Error;
-    console.error("API /api/cards error:", e);
-    return corsJson(
-      { error: "Server error", detail: e.message, name: e.name, stack: e.stack },
-      500
+  } catch (e: any) {
+    console.error('API /api/cards fatal error:', e);
+    return new Response(
+      JSON.stringify({ error: 'Server error', detail: String(e) }),
+      { status: 500 }
     );
   }
 }
